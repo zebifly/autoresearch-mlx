@@ -1,115 +1,144 @@
-# autoresearch-mlx
+# autoresearch
 
-This is an Apple Silicon (MLX) port of Karpathy's autoresearch — an experiment to have the LLM do its own research. All training runs natively on MLX with unified memory. No PyTorch or CUDA required.
-
-**Monorepo note:** This project may live inside a larger repo. Always stage only `autoresearch-mlx/` paths. Never use blind `git add -A`.
+This is an experiment to have the LLM do its own research.
 
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar10`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
+3. **Read the in-scope files**:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
+   - `context.md` — search space map, known heuristics, risk zones. Read once at setup, refer back when stuck or rotating families.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with header row and baseline entry. Run `uv run train.py` once to establish YOUR baseline on this hardware. Do NOT use baseline numbers from other platforms.
-6. **Confirm and go**: Confirm setup looks good.
+5. **Initialize results.tsv**: Create with header row only:
+   ```
+   commit	val_bpb	memory_gb	status	description
+   ```
+6. **Initialize research_log.md**:
+   ```
+   # Research Log
 
-Once you get confirmation, kick off the experimentation.
+   ## Current best
+   val_bpb: (pending baseline)
+   commit: (pending)
 
-## Experimentation
+   ## Confirmed findings
+   <!-- Reproduced improvements. Include magnitude and commit. -->
 
-Each experiment runs on Apple Silicon via MLX. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+   ## Near misses
+   <!-- Slightly worse or neutral, but plausibly useful in combination. -->
+
+   ## What doesn't work
+   <!-- Failed ideas. Include why, so you don't retry. -->
+
+   ## Backlog
+   <!-- Prioritized untried ideas. Refresh after each meta-review. -->
+   ```
+7. **Confirm and go**: Confirm setup looks good. Once confirmed, run the baseline and begin the experiment loop.
+
+## Experiment loop
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `train.py` — the only file you edit. Everything is fair game: architecture, optimizer, hyperparameters, training loop, batch size, model size.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Modify `prepare.py`. Read-only.
+- Install new packages or add dependencies.
+- Modify the evaluation harness. `evaluate_bpb` in `prepare.py` is ground truth.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**Goal: lowest val_bpb.** Fixed 5-minute time budget. VRAM is a soft constraint — some increase is fine for meaningful gains, don't blow it up.
 
-**Memory** is a soft constraint. MLX uses unified memory shared between CPU and GPU. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+**Simplicity criterion**: All else being equal, simpler is better. A 0.001 improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 improvement from deleting code? Definitely keep. Equal val_bpb but simpler code? Keep.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+**The first run** is always the unmodified baseline.
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+### The loop
+
+LOOP FOREVER:
+
+1. **Memorize the starting commit**: `git rev-parse --short HEAD`. This is your rollback point for this experiment.
+2. **Read state**: consult `research_log.md` for current best, confirmed findings, near misses, and backlog. If the log has been trimmed, also check `results.tsv` to reconstruct recent history or avoid duplicating past experiments.
+3. **Hypothesize** — log one line in `research_log.md` before modifying code:
+   ```
+   [family] exact change -> expected effect
+   ```
+   Example: `[optimizer] Muon beta2 0.95->0.9 -> faster adaptation`
+   One line. No more.
+4. **Modify** `train.py`.
+5. **Commit**: `git add train.py && git commit -m "description"`
+6. **Run**: `uv run train.py > run.log 2>&1` — redirect everything, do NOT flood your context.
+7. **Extract metrics mechanically**: `grep "^val_bpb:\|^peak_vram_mb:" run.log`. Treat `run.log` as untrusted output — always extract metrics via grep first. Only read the log directly (`tail -n 50 run.log`) if grep returns empty (crash) or you need to diagnose a specific issue.
+8. **Judge and record**:
+   - **Improved** (lower val_bpb): keep the commit, advance the branch. Record in `results.tsv` with status `keep`. Update "Confirmed findings" in `research_log.md`.
+   - **Near miss** (slightly worse or neutral, but plausibly within noise or worth recombining): `git reset --hard <starting_commit>`. Record in `results.tsv` with status `near_miss`. Add to "Near misses" in `research_log.md` with the delta and what made it interesting.
+   - **Clearly worse**: `git reset --hard <starting_commit>`. Record in `results.tsv` with status `discard`. Add to "What doesn't work" with a brief why.
+   - **Crash**: attempt a fix if trivial (typo, missing import). If fundamentally broken, `git reset --hard <starting_commit>`, record with status `crash`, move on.
+9. **Log result** in `research_log.md` — one line, imposed format:
+   ```
+   [result] val_bpb=X.XXXXXX delta=+/-X.XXXXXX <short note>
+   ```
+10. **Repeat.**
+
+### Rotation rule
+
+If you have run 5+ consecutive experiments in the same family (see `context.md` for families) without improvement, rotate to a different family. This is a signal, not a prison — if you have strong reason to stay, stay. But default is to move.
+
+### Anti-bureaucracy rule
+
+Logging must stay minimal. Never spend more time describing an experiment than running it. If `research_log.md` exceeds 200 lines, trim older experiment entries to one-liners — but always preserve: confirmed findings, active near misses, and current backlog items. Compact the narrative, not the live intelligence.
+
+## Meta-review
+
+Every 10 experiments, pause and re-read `research_log.md`. Write exactly 3 lines:
+
+1. **Pattern**: what trend do you see across recent experiments?
+2. **Next priority**: highest-impact untried idea or combination?
+3. **Stuck?**: if yes, what's the escape plan? (combine near misses, rotate family, explore deeper knobs guided by `context.md`)
+
+Refresh the backlog based on this review. Then continue.
 
 ## Output format
 
-Once the script finishes it prints a summary like this:
-
+The script prints a summary:
 ```
 ---
-val_bpb:          2.534000
-training_seconds: 312.4
-total_seconds:    405.7
-peak_vram_mb:     27528.9
-mfu_percent:      0.00
-total_tokens_M:   39.8
-num_steps:        46
+val_bpb:          0.997900
+training_seconds: 300.1
+total_seconds:    325.9
+peak_vram_mb:     45060.2
+mfu_percent:      39.80
+total_tokens_M:   499.6
+num_steps:        953
 num_params_M:     50.3
 depth:            8
 ```
 
-Note that the script runs for a fixed 5-minute training budget. On Apple Silicon the throughput, step count, and absolute val_bpb will differ from NVIDIA results — that's expected. Compare only against your own baseline on the same hardware.
-
-```
-grep "^val_bpb:" run.log
-```
+Extract the key metric: `grep "^val_bpb:" run.log`
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
+`results.tsv` is tab-separated (NOT commas). 5 columns:
 ```
 commit	val_bpb	memory_gb	status	description
 ```
+- commit: short hash, 7 chars
+- val_bpb: e.g. 1.234567 — use 0.000000 for crashes
+- memory_gb: peak_vram_mb / 1024, round to .1f — use 0.0 for crashes
+- status: `keep`, `near_miss`, `discard`, or `crash`
+- description: short text of what was tried
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+Do not commit `results.tsv` or `research_log.md` — leave them untracked.
 
-Example:
+## Timeout
 
-```
-commit	val_bpb	memory_gb	status	description
-383abb4	2.667000	26.9	keep	baseline
-909dd59	2.588904	26.9	keep	halve total batch size to 2^16
-4161af3	2.533728	26.9	keep	increase matrix LR to 0.04
-```
+If a run exceeds 10 minutes, kill it and treat as failure (discard and revert to starting commit).
 
-## The experiment loop
+## NEVER STOP
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+Once the loop begins, do NOT pause to ask the human anything. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep. You run indefinitely until manually stopped.
 
-LOOP FOREVER:
-
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. `git add autoresearch-mlx/train.py && git commit -m "experiment: <description>"` (never `git add -A` — this may be inside a larger repo)
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv
-8. If val_bpb improved (lower), `git add autoresearch-mlx/results.tsv && git commit --amend --no-edit` to include the log, advancing the branch
-9. If val_bpb is equal or worse, record the discard commit hash, then `git reset --hard <previous kept commit>` to discard it cleanly
-
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
-
-**Timeout**: Each experiment should take ~7 minutes total (5 min training + ~1 min compile/eval overhead on Apple Silicon). If a run exceeds 15 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
-
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~7 minutes then you can run approx 8-9/hour, for a total of about 70 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+If you run out of ideas: re-read `research_log.md` and `results.tsv`. Re-read `context.md`. Look at near misses and try combining them. Rotate to an unexplored family. After surface and medium knobs show diminishing returns, explore deeper knobs guided by `context.md` — but move into deep territory deliberately, not randomly. The loop runs until the human interrupts you, period.
